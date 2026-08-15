@@ -29,7 +29,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key>
   <string>ScreenMarker</string>
   <key>CFBundleIdentifier</key>
-  <string>com.lefeizhang.bianji</string>
+  <string>com.lefeiren.bianji</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
