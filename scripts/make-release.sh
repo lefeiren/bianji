@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="0.1.0"
+VERSION="0.1.1"
 APP_PATH="$ROOT_DIR/dist/边记.app"
 RELEASE_DIR="$ROOT_DIR/releases"
 ZIP_PATH="$RELEASE_DIR/Bianji-v$VERSION.zip"

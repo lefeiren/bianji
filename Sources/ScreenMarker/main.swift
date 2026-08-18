@@ -9,9 +9,35 @@ private func screenMarkerOverlayFrame(for screen: NSScreen) -> NSRect {
 }
 
 @MainActor
+private func makeOverlayWindow(for screen: NSScreen, contentView: NSView) -> NSWindow {
+    let frame = screenMarkerOverlayFrame(for: screen)
+    let window = NSWindow(
+        contentRect: NSRect(origin: .zero, size: frame.size),
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false,
+        screen: screen
+    )
+
+    // The screen-aware initializer treats the content origin as screen-local.
+    // Position the completed window once in the global desktop coordinate space.
+    window.setFrame(frame, display: false)
+    window.backgroundColor = .clear
+    window.isOpaque = false
+    window.hasShadow = false
+    window.level = .floating
+    window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+    window.ignoresMouseEvents = true
+    window.acceptsMouseMovedEvents = true
+    window.contentView = contentView
+    return window
+}
+
+@MainActor
 func runLogicSelfTest() {
     let store = AnnotationStore()
-    let view = OverlayView(store: store)
+    let view = OverlayView(store: store, displayID: 1)
+    let secondView = OverlayView(store: store, displayID: 2)
 
     view.beginAnnotation(at: CGPoint(x: 10, y: 10))
     view.updateAnnotation(at: CGPoint(x: 20, y: 20))
@@ -25,8 +51,15 @@ func runLogicSelfTest() {
     view.finishAnnotation(at: CGPoint(x: 100, y: 100))
     precondition(store.annotations.count == 1, "选择工具后应该可以生成标记")
 
-    view.undo()
-    precondition(store.annotations.isEmpty, "撤回应删除最后一个标记")
+    secondView.beginAnnotation(at: CGPoint(x: 30, y: 30))
+    secondView.finishAnnotation(at: CGPoint(x: 60, y: 60))
+    precondition(store.annotations.count == 2, "每块显示器都应该可以生成标记")
+    precondition(Set(store.annotations.map(\.displayID)) == Set([1, 2]), "多屏标记必须归属各自的显示器")
+
+    store.undo()
+    precondition(store.annotations.count == 1, "撤回应只删除全局最后一个标记")
+    store.clear()
+    precondition(store.annotations.isEmpty, "清空应删除所有显示器上的标记")
 
     store.isDrawingEnabled = true
     view.beginAnnotation(at: CGPoint(x: 10, y: 10))
@@ -37,6 +70,17 @@ func runLogicSelfTest() {
     if let mainScreen = NSScreen.main {
         let overlayFrame = screenMarkerOverlayFrame(for: mainScreen)
         precondition(overlayFrame.maxY <= mainScreen.visibleFrame.maxY + 0.5, "绘图层不能覆盖菜单栏")
+    }
+
+    let displayIDs = NSScreen.screens.compactMap {
+        ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+    }
+    precondition(Set(displayIDs).count == displayIDs.count, "每块显示器必须有独立标识")
+
+    for screen in NSScreen.screens {
+        let window = makeOverlayWindow(for: screen, contentView: NSView())
+        precondition(window.frame == screenMarkerOverlayFrame(for: screen), "绘图层必须完整匹配显示器范围")
+        window.close()
     }
 
     print("PASS: 逻辑自检通过")
@@ -58,12 +102,14 @@ enum AnnotationTool: String, CaseIterable {
 }
 
 final class Annotation: NSObject {
+    let displayID: CGDirectDisplayID
     let tool: AnnotationTool
     let color: NSColor
     let lineWidth: CGFloat
     var points: [CGPoint]
 
-    init(tool: AnnotationTool, color: NSColor, lineWidth: CGFloat, points: [CGPoint]) {
+    init(displayID: CGDirectDisplayID, tool: AnnotationTool, color: NSColor, lineWidth: CGFloat, points: [CGPoint]) {
+        self.displayID = displayID
         self.tool = tool
         self.color = color
         self.lineWidth = lineWidth
@@ -78,6 +124,22 @@ final class AnnotationStore {
     var lineWidth: CGFloat = 4
     var annotations: [Annotation] = []
     var isDrawingEnabled = false
+    var onAnnotationsChanged: (() -> Void)?
+
+    func append(_ annotation: Annotation) {
+        annotations.append(annotation)
+        onAnnotationsChanged?()
+    }
+
+    func undo() {
+        _ = annotations.popLast()
+        onAnnotationsChanged?()
+    }
+
+    func clear() {
+        annotations.removeAll()
+        onAnnotationsChanged?()
+    }
 
     func adjustLineWidth(by step: Int) {
         let currentIndex = strokeWidthOptions
@@ -92,12 +154,14 @@ final class AnnotationStore {
 @MainActor
 final class OverlayView: NSView {
     private let store: AnnotationStore
+    private let displayID: CGDirectDisplayID
     private var currentAnnotation: Annotation?
     private lazy var penCursor = makePenCursor()
     private var trackingArea: NSTrackingArea?
 
-    init(store: AnnotationStore) {
+    init(store: AnnotationStore, displayID: CGDirectDisplayID) {
         self.store = store
+        self.displayID = displayID
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
@@ -108,6 +172,8 @@ final class OverlayView: NSView {
     }
 
     override var acceptsFirstResponder: Bool { true }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -148,6 +214,7 @@ final class OverlayView: NSView {
     func beginAnnotation(at point: CGPoint) {
         guard store.isDrawingEnabled else { return }
         currentAnnotation = Annotation(
+            displayID: displayID,
             tool: store.currentTool,
             color: store.currentColor,
             lineWidth: store.lineWidth,
@@ -183,7 +250,7 @@ final class OverlayView: NSView {
             }
         }
 
-        store.annotations.append(currentAnnotation)
+        store.append(currentAnnotation)
         self.currentAnnotation = nil
         needsDisplay = true
     }
@@ -216,7 +283,7 @@ final class OverlayView: NSView {
         NSColor.clear.setFill()
         dirtyRect.fill()
 
-        for annotation in store.annotations {
+        for annotation in store.annotations where annotation.displayID == displayID {
             draw(annotation)
         }
 
@@ -226,13 +293,15 @@ final class OverlayView: NSView {
     }
 
     func undo() {
-        _ = store.annotations.popLast()
-        needsDisplay = true
+        store.undo()
     }
 
     func clear() {
-        store.annotations.removeAll()
+        store.clear()
         currentAnnotation = nil
+    }
+
+    func annotationsDidChange() {
         needsDisplay = true
     }
 
@@ -379,18 +448,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var overlayViews: [OverlayView] = []
     private var statusController: StatusBarController?
     private var keyMonitor: Any?
+    private var screenChangeObserver: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         installSafetyKeyMonitor()
         createOverlayWindows()
         statusController = StatusBarController(store: store, overlayWindows: overlayWindows, overlayViews: overlayViews)
+        store.onAnnotationsChanged = { [weak self] in
+            self?.overlayViews.forEach { $0.annotationsDidChange() }
+        }
+        screenChangeObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.rebuildOverlayWindows()
+            }
+        }
         NSApp.activate(ignoringOtherApps: true)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         if let keyMonitor {
             NSEvent.removeMonitor(keyMonitor)
+        }
+        if let screenChangeObserver {
+            NotificationCenter.default.removeObserver(screenChangeObserver)
         }
     }
 
@@ -407,12 +492,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "z" {
-                self.overlayViews.forEach { $0.undo() }
+                self.store.undo()
                 return nil
             }
 
             if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "k" {
-                self.overlayViews.forEach { $0.clear() }
+                self.store.clear()
                 return nil
             }
 
@@ -441,30 +526,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func createOverlayWindows() {
         for screen in NSScreen.screens {
-            let view = OverlayView(store: store)
-            let frame = screenMarkerOverlayFrame(for: screen)
-            let window = NSWindow(
-                contentRect: frame,
-                styleMask: [.borderless],
-                backing: .buffered,
-                defer: false,
-                screen: screen
-            )
-
-            window.backgroundColor = .clear
-            window.isOpaque = false
-            window.hasShadow = false
-            window.level = .floating
-            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-            window.ignoresMouseEvents = true
-            window.acceptsMouseMovedEvents = true
-            window.contentView = view
-            window.makeKeyAndOrderFront(nil)
-            window.makeFirstResponder(view)
+            let displayID = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
+            let view = OverlayView(store: store, displayID: displayID)
+            let window = makeOverlayWindow(for: screen, contentView: view)
+            window.orderFrontRegardless()
 
             overlayWindows.append(window)
             overlayViews.append(view)
         }
+    }
+
+    private func rebuildOverlayWindows() {
+        overlayWindows.forEach { $0.close() }
+        overlayWindows.removeAll()
+        overlayViews.removeAll()
+        createOverlayWindows()
+        statusController?.updateOverlayTargets(overlayWindows: overlayWindows, overlayViews: overlayViews)
+        setDrawingEnabled(store.isDrawingEnabled)
+        store.onAnnotationsChanged?()
     }
 
     private func setDrawingEnabled(_ enabled: Bool) {
@@ -489,8 +568,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @MainActor
 final class StatusBarController: NSObject {
     private let store: AnnotationStore
-    private let overlayWindows: [NSWindow]
-    private let overlayViews: [OverlayView]
+    private var overlayWindows: [NSWindow]
+    private var overlayViews: [OverlayView]
     private let statusItem: NSStatusItem
     private var toolItems: [AnnotationTool: NSMenuItem] = [:]
     private var strokeWidthItems: [CGFloat: NSMenuItem] = [:]
@@ -628,6 +707,11 @@ final class StatusBarController: NSObject {
         }
     }
 
+    func updateOverlayTargets(overlayWindows: [NSWindow], overlayViews: [OverlayView]) {
+        self.overlayWindows = overlayWindows
+        self.overlayViews = overlayViews
+    }
+
     private func setDrawingEnabled(_ enabled: Bool) {
         store.isDrawingEnabled = enabled
         overlayWindows.forEach { $0.ignoresMouseEvents = !enabled }
@@ -681,11 +765,11 @@ final class StatusBarController: NSObject {
     }
 
     @objc private func undo() {
-        overlayViews.forEach { $0.undo() }
+        store.undo()
     }
 
     @objc private func clear() {
-        overlayViews.forEach { $0.clear() }
+        store.clear()
     }
 
     @objc private func pauseDrawing() {
